@@ -1,0 +1,37 @@
+ne16:
+  vlog_opts: [
+    +nowarnSVCHK,
+    -suppress 2275,
+    -L hwpe_stream_lib,
+    -L hwpe_ctrl_lib,
+    -L hci_lib,
+  ]
+  incdirs: [
+    .,
+    ../hwpe-stream/rtl,
+    ../hwpe-ctrl/rtl,
+  ]
+  files: [
+    rtl/ne16_package.sv,
+    rtl/accumulator/ne16_accumulator_scm_test_wrap.sv,
+    rtl/input_buffer/ne16_input_buffer_scm_test_wrap.sv,
+    rtl/accumulator/ne16_accumulator_scm.sv,
+    rtl/accumulator/ne16_accumulator_normquant.sv,
+    rtl/accumulator/ne16_normquant.sv,
+    rtl/accumulator/ne16_normquant_shifter.sv,
+    rtl/accumulator/ne16_normquant_bias.sv,
+    rtl/accumulator/ne16_normquant_multiplier.sv,
+    rtl/input_buffer/ne16_input_buffer_scm.sv,
+    rtl/input_buffer/ne16_input_buffer.sv,
+    rtl/array/ne16_scale.sv,
+    rtl/array/ne16_binconv_block.sv,
+    rtl/array/ne16_binconv_column.sv,
+    rtl/array/ne16_binconv_array.sv,
+    rtl/ctrl/ne16_ctrl_fsm.sv,
+    rtl/ctrl/ne16_ctrl_counter.sv,
+    rtl/ctrl/ne16_ctrl.sv,
+    rtl/ne16_engine.sv,
+    rtl/ne16_streamer.sv,
+    rtl/ne16_top.sv,
+    rtl/ne16_top_wrap.sv,
+  ]
