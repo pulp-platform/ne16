@@ -160,7 +160,7 @@ module ne16_ctrl #(
   logic [15:0] norm_bias_len;
   logic [31:0] norm_bias_stride;
 
-  /* multiplexing (mostly!) for auto variables (see ne16_model) */
+  /* runtime parameters */
   logic [15:0] h_size_in;
   logic [15:0] w_size_in;
   logic [15:0] h_size_out;
@@ -175,6 +175,10 @@ module ne16_ctrl #(
   logic [15:0] qw_lim;
   logic [31:0] qw_k_out_lim;
 
+  /* 
+    These assignments are used to calculate online runtime parameters.
+    Some simplification can / should be performed here.
+   */
   assign h_size_in  = (index.i_major < config_.subtile_nb_ho-1) || (config_.subtile_rem_hi==0) ? (config_.filter_mode == NE16_FILTER_MODE_1X1 ? 3 : 5) : config_.subtile_rem_hi;
   assign w_size_in  = (index.j_major < config_.subtile_nb_wo-1) || (config_.subtile_rem_wi==0) ? (config_.filter_mode == NE16_FILTER_MODE_1X1 ? 3 : 5) : config_.subtile_rem_wi;
   assign h_size_out = (index.i_major < config_.subtile_nb_ho-1) || (config_.subtile_rem_ho==0) ? 3 : config_.subtile_rem_ho;
@@ -193,15 +197,20 @@ module ne16_ctrl #(
                                    ( (index.i_major >= config_.subtile_nb_ho-1)                                 && ((index.j_major <  config_.subtile_nb_wo-1) || (config_.subtile_rem_wo==0)))  ? config_.subtile_rem_ho*3 :
                                                                                                                                                                                                    config_.subtile_rem_ho*config_.subtile_rem_wo; // FIXME BEWARE MULTIPLIER!!! --> make static
 
-  assign tot_len_weights       = ~config_.mode_linear & config_.filter_mode == NE16_FILTER_MODE_1X1 ? k_out_lim :
-                                                                               config_.weight_bits * k_out_lim; // repeated config_.subtile_nb_ki times
-  assign d0_len_weights        = ~config_.mode_linear & config_.filter_mode == NE16_FILTER_MODE_1X1 ? 1      : config_.weight_bits;
-  assign dim_enable_1h_weights = ~config_.mode_linear & config_.filter_mode == NE16_FILTER_MODE_1X1 ? 3'b001 : 3'b011;
-
   assign qw_lim = ~config_.mode_linear & config_.filter_mode == NE16_FILTER_MODE_1X1 ? 1 : config_.weight_bits;
-  assign qw_k_out_lim = qw_lim * k_out_lim; // FIXME BEWARE MULTIPLIER!!! --> make static
+  assign qw_k_out_lim = qw_lim * k_out_lim; // this uses a non-static multiplier, consider moving it to an own register
 
-  /* uloop iterators */
+  /* 
+    uloop iterators: these serial multipliers are used to compute subtiling spatial iteration parameters at runtime:
+      input vertical iterator    infeat_hom_iter  <- h_size_out * infeat_d1_stride
+      input horizontal iterator  infeat_wom_iter  <- w_size_out * infeat_d0_stride
+      output vertical iterator   outfeat_hom_iter <- h_size_out * outfeat_d2_stride
+      output horizontal iterator outfeat_wom_iter <- w_size_out * outfeat_d1_stride
+    Output iterators rely on d1,d2 strides due to the fact that the d0 stride is used to discriminate 32/8b outputs.
+    Input iterators rely on d0,d1 strides instead.
+    The products take 16 cycles each (the size of h/w_size_out), at the very start of the NE16 operation.
+    The iterators are used by uloop to compute new indeces inside a loop when using automatic subtiling.
+   */
   logic [47:0] infeat_hom_prod;
   logic        infeat_hom_valid, infeat_hom_ready;
   hwpe_ctrl_seq_mult #( .AW(16), .BW(32) ) i_infeat_hom_iter_mult (
@@ -268,17 +277,37 @@ module ne16_ctrl #(
   );
   assign config_.uloop_iter.outfeat_wom_iter = outfeat_wom_prod[31:0];
 
+  /* 
+    uloop iterators: subtiling channel iteration parameters are computed depending on the various operating filter_modes/linear operation, mode 16/mode 8.
+    The iterators are used by uloop to compute new indeces inside a loop when using automatic subtiling.
+   */
   assign config_.uloop_iter.outfeat_kom_iter = config_.filter_mode == NE16_FILTER_MODE_3X3_DW ? (config_.quant_mode == NE16_MODE_32B ? NE16_TP_IN  << 2 : NE16_TP_IN) :
                                                                                                 (config_.quant_mode == NE16_MODE_32B ? NE16_TP_OUT << 2 : NE16_TP_OUT);
 
-  assign config_.uloop_iter.weights_kom_iter = config_.mode_linear                            ? config_.weights_d2_stride : // FIXME
+  assign config_.uloop_iter.weights_kom_iter = config_.mode_linear                            ? config_.weights_d2_stride :
                                                config_.filter_mode == NE16_FILTER_MODE_3X3_DW ? config_.uloop_iter.weights_kim_iter :
-                                               config_.filter_mode == NE16_FILTER_MODE_3X3    ? NE16_TP_OUT*config_.subtile_nb_ki*config_.weight_bits * 3*3 * (config_.mode_16 ? 1 : 2) :
-                                                                                                NE16_TP_OUT*config_.subtile_nb_ki*config_.weight_bits * (config_.mode_16 ? 1 : 2);
+                                               config_.filter_mode == NE16_FILTER_MODE_3X3    ? NE16_TP_OUT*config_.subtile_nb_ki*config_.weight_bits * 3*3 * (config_.mode_16 ? 1 : 2) : // this uses a non-static multiplier, consider moving it to an own register
+                                                                                                NE16_TP_OUT*config_.subtile_nb_ki*config_.weight_bits * (config_.mode_16 ? 1 : 2);        // this uses a non-static multiplier, consider moving it to an own register
 
   assign config_.uloop_iter.weights_kim_iter = config_.mode_linear                         ? 32 :
                                                config_.filter_mode == NE16_FILTER_MODE_1X1 ? config_.weight_bits * (config_.mode_16 ? 1 : 2) :
-                                                                                             config_.weight_bits * 3*3 * (config_.mode_16 ? 1 : 2); // FIXME linear
+                                                                                             config_.weight_bits * 3*3 * (config_.mode_16 ? 1 : 2);
+
+  /* 
+    uloop reset iterators: these serial multipliers are used to compute subtiling reset iteration parameters at runtime:
+      weights_kom_reset_iter = (subtile_nb_ko-1) * weights_kom_iter
+      weights_kim_reset_iter = (subtile_nb_ki-1) * weights_kim_iter
+      infeat_kim_reset_iter  = (subtile_nb_ki-1) * infeat_kim_iter
+      infeat_wom_reset_iter  = (subtile_nb_wo-1) * infeat_wom_iter
+      infeat_hom_reset_iter  = (subtile_nb_ho-1) * infeat_hom_iter
+      outfeat_kom_reset_iter = (subtile_nb_ko-1) * outfeat_kom_iter
+      outfeat_wom_reset_iter = (subtile_nb_wo-1) * outfeat_wom_iter
+      outfeat_hom_reset_iter = (subtile_nb_ho-1) * outfeat_hom_iter
+    The products take 16 cycles each (the size of h/w_size_out), at the very start of the NE16 operation (for weights) or
+    immediately after the in/outfeat iterator computation has finished (infeat/outfeat iterators).
+    The reset iterators are used by uloop at the end of a loop cycle in order to reset state before switching to an outer
+    loop.
+   */
   logic [15:0] subtile_nb_ko_neg;
   logic [15:0] subtile_nb_ho_neg;
   logic [15:0] subtile_nb_wo_neg;
@@ -418,6 +447,9 @@ module ne16_ctrl #(
 
   assign config_.uloop_iter.scale_kom_iter = 1;
 
+  /* 
+    uloop_ready_q is set whenever the uloop parameters have been calculated.
+   */
   assign uloop_ready_d = infeat_wom_reset_valid & infeat_hom_reset_valid & infeat_kim_reset_valid & outfeat_wom_reset_valid & outfeat_hom_reset_valid & outfeat_kom_reset_valid; // the others are always computed earlier
   always_ff @(posedge clk_i or negedge rst_ni)
   begin
@@ -429,15 +461,45 @@ module ne16_ctrl #(
       uloop_ready_q <= uloop_ready_d;
   end
 
-  /* streamers binding */
+  /* Streamers binding:
+    feat_source   -> infeat
+    weight_source -> weights
+    conv_sink     -> outfeat
+   */
+
+  /*
+    infeat source base address is given by the pointer in regfile + the subtiling offset (base_addr) calculated by uloop.
+    In linear mode, infeat loads 16x 128-bit words in 8-bit mode, 32x 128-bit words in 16-bit mode. In 1x1 mode, it loads 9x 128-bit words; in 3x3 mode (DW or regular), 25x 128-bit words.
+    These are divided in two dimensions:
+     - d0: 3 elements in 1x1 mode, 5 in 3x3 mode, 16/32 in linear mode (for 8/16 bit respectively)
+     - d1: 3 elements in 1x1 mode, 5 in 3x3 mode, disabled in linear mode
+    Strides for d0, d1 are directly propagated from register file.
+    Stride for d2 is currently unused.
+  */
   assign ctrl_streamer_d.feat_source_ctrl.addressgen_ctrl.base_addr     = config_.infeat_ptr + base_addr.infeat;
   assign ctrl_streamer_d.feat_source_ctrl.addressgen_ctrl.tot_len       = config_.mode_linear ? (config_.mode_16 ? 32 : 16) : config_.filter_mode == NE16_FILTER_MODE_1X1 ? 9 : 25;
   assign ctrl_streamer_d.feat_source_ctrl.addressgen_ctrl.d0_stride     = config_.infeat_d0_stride;
-  assign ctrl_streamer_d.feat_source_ctrl.addressgen_ctrl.d0_len        = config_.mode_linear ? (config_.mode_16 ? 32 : 16) : config_.filter_mode == NE16_FILTER_MODE_1X1 ? 3 : 5; // w_size_in
+  assign ctrl_streamer_d.feat_source_ctrl.addressgen_ctrl.d0_len        = config_.mode_linear ? (config_.mode_16 ? 32 : 16) : config_.filter_mode == NE16_FILTER_MODE_1X1 ? 3 : 5;
   assign ctrl_streamer_d.feat_source_ctrl.addressgen_ctrl.d1_stride     = config_.infeat_d1_stride;
-  assign ctrl_streamer_d.feat_source_ctrl.addressgen_ctrl.d1_len        = config_.mode_linear ? '1 : config_.filter_mode == NE16_FILTER_MODE_1X1 ? 3 : 5; // h_size_in_X_w_size_in;
-  assign ctrl_streamer_d.feat_source_ctrl.addressgen_ctrl.d2_stride     = config_.infeat_d2_stride;
+  assign ctrl_streamer_d.feat_source_ctrl.addressgen_ctrl.d1_len        = config_.mode_linear ? '1 : config_.filter_mode == NE16_FILTER_MODE_1X1 ? 3 : 5;
+  assign ctrl_streamer_d.feat_source_ctrl.addressgen_ctrl.d2_stride     = config_.infeat_d2_stride; // currently unused
   assign ctrl_streamer_d.feat_source_ctrl.addressgen_ctrl.dim_enable_1h = config_.mode_linear ? 3'b001 : '1;
+
+  /*
+    weight source base address is given by the pointer in regfile + the subtiling offset (base_addr) calculated by uloop.
+    In 1x1 mode, weight loads k_out_lim (up to 32x) 144-bit words. In all other modes, it loads weight_bits * k_out_lim (up to 8 * 32x) 144-bit words.
+    These are divided in two dimensions:
+     - d0: 1 element in 1x1 mode, weight_bits (up to 8x) in other modes
+     - d1: disabled in 1x1 mode, k_out_lim (up to 32x) in other modes
+    Strides for d0, d1 are directly propagated from register file.
+    Stride for d2 is technically propagated to the streamer but not actually used there directly, because d0,d1 exhaust the full iteration.
+    However, it is used to calculate weight subtiling iterators.
+  */
+
+  assign tot_len_weights       = ~config_.mode_linear & config_.filter_mode == NE16_FILTER_MODE_1X1 ? k_out_lim :
+                                                                               config_.weight_bits * k_out_lim; // repeated config_.subtile_nb_ki times
+  assign d0_len_weights        = ~config_.mode_linear & config_.filter_mode == NE16_FILTER_MODE_1X1 ? 1      : config_.weight_bits;
+  assign dim_enable_1h_weights = ~config_.mode_linear & config_.filter_mode == NE16_FILTER_MODE_1X1 ? 3'b001 : 3'b011;
 
   assign ctrl_streamer_d.weight_source_ctrl.addressgen_ctrl.base_addr     = config_.weights_ptr + base_addr.weights;
   assign ctrl_streamer_d.weight_source_ctrl.addressgen_ctrl.tot_len       = tot_len_weights;
@@ -447,6 +509,26 @@ module ne16_ctrl #(
   assign ctrl_streamer_d.weight_source_ctrl.addressgen_ctrl.d1_len        = ~config_.mode_linear & config_.filter_mode == NE16_FILTER_MODE_1X1 ? 1 : '1;
   assign ctrl_streamer_d.weight_source_ctrl.addressgen_ctrl.d2_stride     = config_.weights_d2_stride;
   assign ctrl_streamer_d.weight_source_ctrl.addressgen_ctrl.dim_enable_1h = dim_enable_1h_weights;
+
+  /*
+    outfeat sink base address is given by the pointer in regfile + the subtiling offset (base_addr) calculated by uloop.
+    The total length is given by the output quantization mode and by the number of output channels in the current subtile, 
+    according to the following rule:
+     - 8-bit  quant                       --> length = 9
+     - 32-bit quant, k_out_lim in [25,32] --> length = 36
+     - 32-bit quant, k_out_lim in [17,24] --> length = 27
+     - 32-bit quant, k_out_lim in [9,16]  --> length = 18
+     - 32-bit quant, k_out_lim in [1,8]   --> length = 9
+    Notice that even if the subtile is not spatially full due to remainders or padding, all column accumulators are streamed
+    out none the less -- disabling the write enables for columns that are not actually used. This also applies to linear mode,
+    which accumulates outputs only on the first column.
+    These are divided in three dimensions:
+     - d0: total length divided by 9
+     - d1: 3 elements
+     - d2: 3 elements
+    Strides for d0, d1, d2 are directly propagated from register file.
+    Notice that these parameters are also used for streamin, not only streamout.
+  */
 
   logic [15:0] w_size_out_with_strb;              // currently using a nil'd strobe to remove outputs --> constant w_size_out
   logic [31:0] h_size_out_X_w_size_out_with_strb; // currently using a nil'd strobe to remove outputs --> constant h_size_out / w_size_out
@@ -463,6 +545,34 @@ module ne16_ctrl #(
   assign ctrl_streamer_d.conv_sink_ctrl.addressgen_ctrl.d2_stride     = config_.outfeat_d2_stride;
   assign ctrl_streamer_d.conv_sink_ctrl.addressgen_ctrl.dim_enable_1h = '1;
   assign ctrl_streamer_d.streamin_source_ctrl.addressgen_ctrl = ctrl_streamer_d.conv_sink_ctrl; // streamin is tied to streamout
+
+  /*
+    scale/bias source base address is given by the pointer in regfile + the subtiling offset (base_addr) calculated by uloop.
+    It is used for three distinct parameters: scale, bias, and shift.
+
+    Scale:
+    The total length of scale is given by the output scaling mode and by the number of output channels in the current subtile, 
+    according to the following rule:
+     - 8-bit  scaling                       --> length = 1
+     - 16-bit scaling, k_out_lim in [17,32] --> length = 2
+     - 16-bit scaling, k_out_lim in [1,16]  --> length = 1
+     - 32-bit scaling, k_out_lim in [25,32] --> length = 4
+     - 32-bit scaling, k_out_lim in [17,24] --> length = 3
+     - 32-bit scaling, k_out_lim in [9,16]  --> length = 2
+     - 32-bit scaling, k_out_lim in [1,8]   --> length = 1
+    These are single-dimension, with d0 stride statically set to 32.
+    
+    Shift:
+    The total length of shift is 1 (if norm_option_shift is set).
+
+    Bias:
+    The total length of bias is given by the number of output channels in the current subtile (if norm_option_bias is set):
+     - k_out_lim in [25,32] --> length = 4
+     - k_out_lim in [17,24] --> length = 3
+     - k_out_lim in [9,16]  --> length = 2
+     - k_out_lim in [1,8]   --> length = 1
+    The access pattern is single-dimension, with d0 stride statically set to 32.
+  */
 
   assign norm_len    = (config_.norm_mode == NE16_MODE_8B)                     ? 1 :
                        (config_.norm_mode == NE16_MODE_16B && k_out_lim <= 16) ? 1 :
@@ -496,29 +606,44 @@ module ne16_ctrl #(
   assign ctrl_streamer_d.norm_source_ctrl.addressgen_ctrl.d0_stride = state==NORMQUANT       ? norm_stride :
                                                                       state==NORMQUANT_BIAS  ? norm_bias_stride :
                                                                       state==NORMQUANT_SHIFT ? norm_shift_stride : '0;
-  assign ctrl_streamer_d.norm_source_ctrl.addressgen_ctrl.d0_len        = '0; // FIXME
-  assign ctrl_streamer_d.norm_source_ctrl.addressgen_ctrl.d1_stride     = '0; // FIXME
-  assign ctrl_streamer_d.norm_source_ctrl.addressgen_ctrl.d1_len        = '0; // FIXME
-  assign ctrl_streamer_d.norm_source_ctrl.addressgen_ctrl.d2_stride     = '0; // FIXME
+  assign ctrl_streamer_d.norm_source_ctrl.addressgen_ctrl.d0_len        = '0;
+  assign ctrl_streamer_d.norm_source_ctrl.addressgen_ctrl.d1_stride     = '0;
+  assign ctrl_streamer_d.norm_source_ctrl.addressgen_ctrl.d1_len        = '0;
+  assign ctrl_streamer_d.norm_source_ctrl.addressgen_ctrl.d2_stride     = '0;
   assign ctrl_streamer_d.norm_source_ctrl.addressgen_ctrl.dim_enable_1h = 2;
 
+  /*
+    Streamers are kick-started in the appropriate state when the state_change bit is 1, indicating
+    a state transition (like in a Mealy FSM).
+  */
   assign ctrl_streamer_d.feat_source_ctrl.req_start     = (state==LOAD)       & state_change;
   assign ctrl_streamer_d.weight_source_ctrl.req_start   = config_.streamin ? (state==MATRIXVEC & state_change) : (state==WEIGHTOFFS & state_change);
   assign ctrl_streamer_d.norm_source_ctrl.req_start     = (state==NORMQUANT || state==NORMQUANT_BIAS || state==NORMQUANT_SHIFT)  & state_change;
   assign ctrl_streamer_d.conv_sink_ctrl.req_start       = (state==STREAMOUT)  & state_change;
   assign ctrl_streamer_d.streamin_source_ctrl.req_start = (state==STREAMIN)   & state_change;
 
+  /*
+    Set the streamer muxes / demuxes according to the current operating state.
+  */
   assign ctrl_streamer_d.ld_which_mux_sel = (state==LOAD)                                                         ? LD_FEAT_SEL :
                                             (state==MATRIXVEC || state==WEIGHTOFFS)                               ? LD_WEIGHT_SEL :
                                             (state==NORMQUANT || state==NORMQUANT_BIAS || state==NORMQUANT_SHIFT) ? LD_NORM_SEL :
                                             (state==STREAMIN)                                                     ? LD_STREAMIN_SEL :
                                                                                                                     LD_FEAT_SEL;
   assign ctrl_streamer_d.ld_st_mux_sel    = (state==STREAMOUT || state==STREAMOUT_DONE) ? ST_SEL : LD_SEL;
+
+  /*
+    Clear FIFO contents when moving in/out of certain states, to disable spurious transactions that might
+    have creeped in.
+  */
   assign ctrl_streamer_d.clear_fifo       = (state==LOAD) & state_change;
   assign ctrl_streamer_d.clear_source     = (state==STREAMOUT || state==STREAMOUT_DONE);
   assign ctrl_streamer_d.clear_sink       = (state==LOAD) & state_change;
 
-  /* implicit & explicit padding + filter masking control */
+  /*
+    Implicit padding indicates the output padding that is "required" by spatial subtiling residuals.
+    Explicit padding is that imposed externally by means of padding configuration registers.
+  */
   logic [NE16_INPUT_BUFFER_SIZE-1:0] implicit_padding_map;
   logic [NE16_INPUT_BUFFER_SIZE-1:0] explicit_padding_map;
   logic [9-1:0] filter_mask_map;
@@ -526,6 +651,9 @@ module ne16_ctrl #(
   logic [4:0] h_size_in_map;
   logic [4:0] w_size_in_map;
 
+  /*
+    implicit_padding_map encodes which of the 5x5 elements in the array are valid (1) and which ones are unused (0).
+  */
   assign h_size_in_map = (1 << h_size_in) - 1;
   assign w_size_in_map = (1 << w_size_in) - 1;
   always_comb
@@ -548,6 +676,9 @@ module ne16_ctrl #(
   assign b_explicit_padding_map   = {<<{b_explicit_padding_map_r}};
   assign l_explicit_padding_map   = (1 << config_.padding_left) - 1;
 
+  /*
+    explicit_padding_map encodes which of the 5x5 elements in the array are padded (0) and which ones are not (1).
+  */
   always_comb
   begin
     explicit_padding_map = '0;
@@ -562,7 +693,10 @@ module ne16_ctrl #(
       explicit_padding_map[24:0] |= {{5{b_explicit_padding_map[4]}}, {5{b_explicit_padding_map[3]}}, {5{b_explicit_padding_map[2]}}, {5{b_explicit_padding_map[1]}}, {5{b_explicit_padding_map[0]}}};
   end
 
-
+  /*
+    Filter masking in the current implementation works like padding.
+    Currently, there is no logic to scatter contiguous filters into a filter-masked configuration --> this has to be fixed in further revisions.
+  */
   logic [2:0] t_filter_mask_map;
   logic [2:0] r_filter_mask_map_r, r_filter_mask_map;
   logic [2:0] b_filter_mask_map_r, b_filter_mask_map;
@@ -575,6 +709,9 @@ module ne16_ctrl #(
   assign b_filter_mask_map   = {<<{b_filter_mask_map_r}};
   assign l_filter_mask_map   = (1 << config_.filter_mask_left) - 1;
 
+  /*
+    filter_mask_map encodes which of the 3x3 filters in the array are filtered (1) and which ones are not (0).
+  */
   always_comb
   begin
     filter_mask_map = '0;
@@ -585,37 +722,74 @@ module ne16_ctrl #(
     filter_mask_map |= {{3{b_filter_mask_map[2]}}, {3{b_filter_mask_map[1]}}, {3{b_filter_mask_map[0]}}};
   end
 
-  /* datapath binding */
-  assign ctrl_engine_d.ctrl_input_buffer.goto_load    = (state==LOAD) & state_change;
+  /* 
+    binding of datapath control signals
+   */
+
+  // input buffer goes to its LOAD state together with the ctrl FSM LOAD state
+  assign ctrl_engine_d.ctrl_input_buffer.goto_load    = (state==LOAD) & state_change; 
+  // input buffer goes to its EXTRACT state autonomously, so goto_extract is bound to 0
   assign ctrl_engine_d.ctrl_input_buffer.goto_extract = '0;
+  // input buffer goes to its IDLE state when the main FSM enters a state that is not LOAD, WEIGHTOFFS, MATRIXVEC, STREAMIN (or UPDATEIDX, when the 3x3 depthwise mode is used)
   assign ctrl_engine_d.ctrl_input_buffer.goto_idle    = config_.filter_mode == NE16_FILTER_MODE_3X3_DW ? (state!=LOAD && state!=WEIGHTOFFS && state!=MATRIXVEC && state!=STREAMIN && state!=UPDATEIDX) & state_change :
                                                                                                          (state!=LOAD && state!=WEIGHTOFFS && state!=MATRIXVEC && state!=STREAMIN) & state_change;
-  assign ctrl_engine_d.ctrl_input_buffer.load_len     = config_.mode_linear ? (config_.mode_16 ? 32 : 16) : config_.filter_mode == NE16_FILTER_MODE_1X1 ? 13 : 25; // FIXME at the moment, 1x1 takes 13 cycles because not "jumping" to the right pixels
+  // the input buffer load length is essentially aligned to the tot_length of the infeat source, with some overhead for what concerns 1x1 mode (FIXME: should be possible to optimize this).
+  assign ctrl_engine_d.ctrl_input_buffer.load_len     = config_.mode_linear ? (config_.mode_16 ? 32 : 16) : config_.filter_mode == NE16_FILTER_MODE_1X1 ? 13 : 25;
 
+  // propagate implicit padding, except for linear mode, and explicit padding
   assign ctrl_engine_d.ctrl_input_buffer.enable_implicit_padding = config_.mode_linear ? '0 : ~implicit_padding_map;
   assign ctrl_engine_d.ctrl_input_buffer.enable_explicit_padding = explicit_padding_map;
   assign ctrl_engine_d.ctrl_input_buffer.explicit_padding_value_lo = config_.padding_value[7:0];
-  assign ctrl_engine_d.ctrl_input_buffer.explicit_padding_value_hi = config_.mode_16 ? config_.padding_value[15:8] : config_.padding_value[7:0]; // can also be just [15:8] to save complexity if to be implemented with ECO
+  assign ctrl_engine_d.ctrl_input_buffer.explicit_padding_value_hi = config_.mode_16 ? config_.padding_value[15:8] : config_.padding_value[7:0];
+
+  // in linear mode, the input buffer works similarly to 3x3 mode
   assign ctrl_engine_d.ctrl_input_buffer.filter_mode = config_.mode_linear ? NE16_FILTER_MODE_3X3 : config_.filter_mode;
 
+  // the NE array has 9 columns -- one per each spatial pixel in the output space that it can support (3x3)
   logic [2:0] enable_column_vert, enable_column_horiz;
   logic [8:0] enable_column_strided;
   logic [8:0] enable_column;
+
+  // enable columns depending on the subtile size considering residuals in the horizontal & vertical directions
   assign enable_column_vert  = (1 << h_size_out) - 1;
   assign enable_column_horiz = (1 << w_size_out) - 1;
+
+  // in 2x2 strided mode, apply an explicit mask of pattern
+  //   +---+---+---+ 
+  //   | 1 | 0 | 1 |
+  //   +---+---+---+
+  //   | 0 | 0 | 0 |
+  //   +---+---+---+
+  //   | 1 | 0 | 1 |
+  //   +---+---+---+
   assign enable_column_strided = config_.mode_strided ? 9'b101000101 : '1;
+
+  // overall column enable takes into account both horizontal and vertical enables, as well as strided mode
   assign enable_column = {3 {enable_column_horiz}} & {{3{enable_column_vert[2]}}, {3{enable_column_vert[1]}}, {3{enable_column_vert[0]}}} & enable_column_strided;
 
+  // propagate config to NE16 binconv array
   assign ctrl_engine_d.ctrl_binconv_array.weight_offset = state==LOAD | state==WEIGHTOFFS;
   assign ctrl_engine_d.ctrl_binconv_array.filter_mode = config_.filter_mode;
-  assign ctrl_engine_d.ctrl_binconv_array.enable_column = config_.mode_linear ? (config_.mode_16 ? 9'b01111 : 9'b011 ) : enable_column;
   assign ctrl_engine_d.ctrl_binconv_array.depthwise_len = k_in_lim[4:0];
   assign ctrl_engine_d.ctrl_binconv_array.mode_linear = config_.mode_linear;
   assign ctrl_engine_d.ctrl_binconv_array.mode_16 = config_.mode_16;
+  assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.padding_value = config_.padding_value;
+  assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.ctrl_block.qw = config_.weight_bits;
+  assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.ctrl_block.filter_mode = config_.filter_mode;
+  assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.ctrl_block.weight_offset = state==LOAD | state==WEIGHTOFFS;
+  assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.ctrl_block.mode_16 = config_.mode_16;
+  assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.ctrl_block.mode_linear = config_.mode_linear;
+  
+  // in linear mode, the first 2 columns (8-bit mode) or the first 4 columns (16-bit mode) are used, ignoring the enable_column calculated above
+  assign ctrl_engine_d.ctrl_binconv_array.enable_column = config_.mode_linear ? (config_.mode_16 ? 9'b01111 : 9'b011 ) : enable_column;
+
+  // block-level enables depend on the operating mode -- during WEIGHTOFFS, only 1; in 1x1 mode, as many as the weight_bits are; and in 3x3, all 9 according to the filter_mask_map
   assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.enable_block  = config_.mode_linear ? 8'hff :
                                                                       ((state==LOAD || state==WEIGHTOFFS) && config_.filter_mode == NE16_FILTER_MODE_1X1) ? 1 :
                                                                       (config_.filter_mode == NE16_FILTER_MODE_1X1)                                       ? (1 << config_.weight_bits) - 1 :
                                                                                                                                                            ~filter_mask_map;
+
+  // in linear mode, 8 blocks per column are used, one for each k_in supported -- the following maps these according to the configured k_in_lim
   generate
     for(genvar rr=0; rr<NE16_NR_COLUMN; rr++) begin : enable_block_linear_row_gen
       for(genvar cc=0; cc<NE16_COLUMN_SIZE; cc++) begin : enable_block_linear_col_gen
@@ -626,16 +800,16 @@ module ne16_ctrl #(
     end
   endgenerate
 
-  assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.padding_value = config_.padding_value;
-  assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.ctrl_block.qw = config_.weight_bits;
-  assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.ctrl_block.filter_mode = config_.filter_mode;
-  assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.ctrl_block.weight_offset = state==LOAD | state==WEIGHTOFFS;
+  // clear array state when entering LOAD or MATRIXVEC
   assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.ctrl_block.clear = (state==LOAD || state==MATRIXVEC) & state_change;
-  assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.ctrl_block.enable_mac = config_.mode_linear ? '1 : (1 << k_in_lim) - 1;
-  assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.ctrl_block.mode_16 = config_.mode_16;
-  assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.ctrl_block.mode_linear = config_.mode_linear;
 
+  // inside each block, enable by default all 1x8b MACs in linear mode, or k_in_lim ones otherwise
+  assign ctrl_engine_d.ctrl_binconv_array.ctrl_column.ctrl_block.enable_mac = config_.mode_linear ? '1 : (1 << k_in_lim) - 1;
+
+  // enable accumulator ICG cells
   assign ctrl_engine_d.enable_accumulator = config_.mode_linear ? 9'b01 : enable_column;
+
+  // control the accumulator's state or the norm/quant unit's state
   assign ctrl_engine_d.ctrl_accumulator.clear          = (state==IDLE) | (state==STREAMOUT_DONE && state_change==1'b1);
   assign ctrl_engine_d.ctrl_accumulator.clear_offset   = (state==IDLE) | (state==WEIGHTOFFS && state_change==1'b1);
   assign ctrl_engine_d.ctrl_accumulator.goto_normquant = ((state==NORMQUANT & ~config_.norm_option_shift) | (state==NORMQUANT_SHIFT)) & state_change;
@@ -682,6 +856,7 @@ module ne16_ctrl #(
   assign ctrl_engine_d.ctrl_accumulator.norm_option_bias  = config_.norm_option_bias;
   assign ctrl_engine_d.ctrl_accumulator.norm_option_shift = config_.norm_option_shift;
 
+  // the serializer is used to combine data from multiple columns
   assign ctrl_engine_d.ctrl_serialize.first_stream       = '0;
   assign ctrl_engine_d.ctrl_serialize.clear_serdes_state = '0;
   assign ctrl_engine_d.ctrl_serialize.nb_contig_m1       = (config_.quant_mode == NE16_MODE_32B) ? (k_out_lim/(NE16_MEM_BANDWIDTH/NE16_ACCUM_SIZE) + (k_out_lim%(NE16_MEM_BANDWIDTH/NE16_ACCUM_SIZE)==0 ? 0 : 1) )-1 : 0;
@@ -690,6 +865,7 @@ module ne16_ctrl #(
   assign ctrl_engine_d.mode_16 = config_.mode_16;
   assign ctrl_engine_d.mode_linear  = config_.mode_linear;
 
+  // engine and streamer configuration is propagated with one cycle of delay
   always_ff @(posedge clk_i or negedge rst_ni)
   begin
     if(~rst_ni) begin

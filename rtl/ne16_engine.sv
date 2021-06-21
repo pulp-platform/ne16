@@ -218,7 +218,18 @@ module ne16_engine #(
     .clk ( clk_i )
   );
 
-  /* stream splitters / mergers */
+  // Infeat data from the input buffer is split in blocks of size 16bits
+  //
+  //            load_in[256b]
+  //                 ||
+  //                 \/
+  //         +-----------------+
+  //         |hwpe_stream_split|
+  //         +-----------------+
+  //                 ||
+  //                 \/
+  //        load_in_blocks[15:0][16b]
+
   hwpe_stream_split #(
     .NB_OUT_STREAMS ( BLOCK_SIZE            ),
     .DATA_WIDTH_IN  ( NE16_QA_IN*BLOCK_SIZE )
@@ -229,6 +240,64 @@ module ne16_engine #(
     .push_i  ( load_in        ),
     .pop_o   ( load_in_blocks )
   );
+  
+  // The following diagram explains the way that the weight stream is split in order to
+  // support the various CONV modes and the LINEAR mode at 16 and 8 bits.
+  // 
+  //                               load_weight[256b]
+  //                                      ||
+  //                                      \/
+  //                                    |____|
+  //                                    |____| hwpe_stream_fifo
+  //                                      ||
+  //                                      \/
+  //                             load_weight_fifo[256b]
+  //                                      ||
+  //                                      \/
+  //                          /------------------------\
+  // ctrl_i.mode16 ------->  /__________________________\
+  //                          || 0                  1 ||
+  //                          \/                      \/
+  //       load_weight_fifo_demuxed[0][256b] load_weight_fifo_demuxed[1][256b]
+  //                          ||                      ||
+  //                          \/                      \/
+  //                 +-----------------+      +-----------------+
+  //                 |hwpe_stream_split|      |hwpe_stream_split|
+  //                 +-----------------+      +-----------------+
+  //                          ||                      ||
+  //                          ||                      \/
+  //                          ||                load_weight_rows_mode16_8bit[31:0][8b]
+  //                          ||                      ||
+  //                          ||                      \/
+  //                          ||              +-----------------+
+  //                          ||              |   zero-extend   |
+  //                          ||              +-----------------+
+  //                          ||                      ||
+  //                          \/                      \/
+  //       load_weight_rows_mode8[15:0][16b]    load_weight_rows_mode16[31:0][16b]
+  //
+  //
+  // Convolutional modes actually use only 144 of the 256bits of memory interface:
+  //       load_weight_rows_mode8[15:0][16b]    load_weight_rows_mode16[31:0][16b]
+  //                          || [8:0]]               || [8:0]
+  //                          \/ 0                  1 \/
+  //                         \--------------------------/
+  // ctrl_i.mode16 ---------->\________________________/
+  //                                      ||
+  //                                      \/
+  //                          load_weight_rows_conv[8:0][16b]
+  //
+  // 
+  // Linear mode uses 256 bits of bandwidth in both 8 and 16 bit modes -- with 16 bit mode using 2x the number of MACs
+  //
+  //       load_weight_rows_mode8[15:0][16b]    load_weight_rows_mode16[31:0][16b]                     256b zeros              load_weight_rows_mode16[31:0][16b]  
+  //                          ||                      || [15:0]                                              ||                      || [31:16]           
+  //                          \/ 0                  1 \/                                                     \/ 0                  1 \/                            
+  //                         \--------------------------/                                                   \--------------------------/                           
+  // ctrl_i.mode16 ---------->\________________________/                            ctrl_i.mode16 ---------->\________________________/                            
+  //                                      ||                                                                             ||                                        
+  //                                      \/                                                                             \/                                        
+  //                          load_weight_rows_linear[15:0][16b]                                             load_weight_rows_linear[31:0][16b]                    
 
   hwpe_stream_fifo #(
     .DATA_WIDTH ( NE16_MEM_BANDWIDTH ),
@@ -317,6 +386,18 @@ module ne16_engine #(
 
   endgenerate
 
+  // Streamout data from the column accumulators is serialized one column after the other
+  //
+  //        store_out_cols[8:0][256b]
+  //                 ||
+  //                 \/
+  //       +---------------------+
+  //       |hwpe_stream_serialize|
+  //       +---------------------+
+  //                 ||
+  //                 \/
+  //           store_out[256b]
+
   hwpe_stream_serialize #(
     .NB_IN_STREAMS ( NR_COLUMN          ),
     .DATA_WIDTH    ( NE16_MEM_BANDWIDTH )
@@ -327,6 +408,37 @@ module ne16_engine #(
     .ctrl_i  ( ctrl_i.ctrl_serialize ),
     .push_i  ( store_out_cols        ),
     .pop_o   ( store_out             )
+  );
+
+  // Streamin data goingo into the column accumulators comes per column and is deserialized
+  //
+  //          load_streamin[256b]
+  //                 ||
+  //                 \/
+  //               |____|
+  //               |____| hwpe_stream_fifo
+  //                 ||
+  //                 \/
+  //        load_streamin_fifo[256b]
+  //                 ||
+  //                 \/
+  //      +-----------------------+
+  //      |hwpe_stream_deserialize|
+  //      +-----------------------+
+  //                 ||
+  //                 \/
+  //           load_streamin_cols[8:0][256b]
+
+  hwpe_stream_fifo #(
+    .DATA_WIDTH ( NE16_MEM_BANDWIDTH ),
+    .FIFO_DEPTH ( 2                  )
+  ) i_fifo_load_streamin (
+    .clk_i   ( clk_i              ),
+    .rst_ni  ( rst_ni             ),
+    .clear_i ( clear_i            ),
+    .flags_o (                    ),
+    .push_i  ( load_streamin      ),
+    .pop_o   ( load_streamin_fifo )
   );
 
   hwpe_stream_deserialize #(
@@ -341,6 +453,20 @@ module ne16_engine #(
     .pop_o   ( load_streamin_cols         )
   );
 
+  // The same norm stream, coming simply from a FIFO, is shared between all columns.
+  //
+  //          load_norm[256b]
+  //                 ||
+  //                 \/
+  //               |____|
+  //               |____| hwpe_stream_fifo
+  //                 ||
+  //                 \/
+  //          load_norm_fifo[256b]
+  //                 || copy 9x
+  //                 \/
+  //             norm[8:0][256b]
+
   // enqueue norm stream
   hwpe_stream_fifo #(
     .DATA_WIDTH ( NE16_MEM_BANDWIDTH ),
@@ -352,18 +478,6 @@ module ne16_engine #(
     .flags_o (                ),
     .push_i  ( load_norm      ),
     .pop_o   ( load_norm_fifo )
-  );
-
-  hwpe_stream_fifo #(
-    .DATA_WIDTH ( NE16_MEM_BANDWIDTH ),
-    .FIFO_DEPTH ( 2                  )
-  ) i_fifo_load_streamin (
-    .clk_i   ( clk_i              ),
-    .rst_ni  ( rst_ni             ),
-    .clear_i ( clear_i            ),
-    .flags_o (                    ),
-    .push_i  ( load_streamin      ),
-    .pop_o   ( load_streamin_fifo )
   );
 
   // duplicate norm stream
