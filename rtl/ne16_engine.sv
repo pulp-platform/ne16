@@ -220,7 +220,7 @@ module ne16_engine #(
 
   // Infeat data from the input buffer is split in blocks of size 16bits
   //
-  //            load_in[256b]
+  //            load_in[128b]
   //                 ||
   //                 \/
   //         +-----------------+
@@ -228,7 +228,7 @@ module ne16_engine #(
   //         +-----------------+
   //                 ||
   //                 \/
-  //        load_in_blocks[15:0][16b]
+  //        load_in_blocks[15:0][8b]
 
   hwpe_stream_split #(
     .NB_OUT_STREAMS ( BLOCK_SIZE            ),
