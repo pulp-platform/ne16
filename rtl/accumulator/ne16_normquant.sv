@@ -93,8 +93,8 @@ module ne16_normquant #(
     assign product_48b[2] = $signed(product[2]);
     assign product_48b[3] = $signed(product[3]);
     assign product_32b    = $signed(product_48b[0] + (product_48b[1] <<< 8) + (product_48b[2] <<< 16) + (product_48b[3] <<< 24));
-    assign product_16b[0] = $signed(product[0] + (product[1] <<< 8));
-    assign product_16b[1] = $signed(product[2] + (product[3] <<< 8));
+    assign product_16b[0] = $signed(product_48b[0] + (product_48b[1] <<< 8));
+    assign product_16b[1] = $signed(product_48b[2] + (product_48b[3] <<< 8));
     assign product_8b[0]  = $signed(product[0]);
     assign product_8b[1]  = $signed(product[1]);
     assign product_8b[2]  = $signed(product[2]);
